@@ -14,6 +14,7 @@ import io.kubernetes.client.util.PatchUtils;
 import org.apache.commons.lang3.StringUtils;
 
 import java.io.IOException;
+import java.io.Reader;
 import java.util.List;
 import java.util.Map;
 
@@ -25,13 +26,29 @@ public class K8s {
     private ApiClient client;
 
     public K8s() {
-        this(null);
+        this(null,null);
     }
 
     public K8s(String file) {
         try {
             if (StringUtils.isNotEmpty(file)) {
                 client = Config.fromConfig(file);
+            } else {
+                client = ClientBuilder.standard().build();
+            }
+        } catch (Exception e) {
+            //Client build failure throws an exception
+            throw new RuntimeException(e);
+        } finally {
+            Configuration.setDefaultApiClient(client);
+//            client.setDebugging(true);
+        }
+    }
+
+    public K8s(Reader input) {
+        try {
+            if (input != null) {
+                client = Config.fromConfig(input);
             } else {
                 client = ClientBuilder.standard().build();
             }
@@ -130,7 +147,7 @@ public class K8s {
      * @throws ApiException
      */
     public V1Deployment createDeployment(String namespace, String json) throws IOException, ApiException {
-		//V1Deployment v = new Gson().fromJson(json, V1Deployment.class);
+        //V1Deployment v = new Gson().fromJson(json, V1Deployment.class);
         AppsV1Api appsV1Api = new AppsV1Api(client);
         V1Deployment body = Configuration.getDefaultApiClient().getJSON().deserialize(json, V1Deployment.class);
         return appsV1Api.createNamespacedDeployment(namespace, body, "false", null, null);
