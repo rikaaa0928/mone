@@ -31,9 +31,9 @@ import io.fabric8.kubernetes.api.model.apps.ReplicaSetList;
 import io.fabric8.kubernetes.api.model.autoscaling.v1.HorizontalPodAutoscalerList;
 import io.fabric8.kubernetes.api.model.batch.v1.Job;
 import io.fabric8.kubernetes.api.model.batch.v1.JobList;
+import io.fabric8.kubernetes.client.ConfigBuilder;
 import io.fabric8.kubernetes.client.DefaultKubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.dsl.ExecWatch;
 import io.fabric8.kubernetes.client.dsl.MixedOperation;
 import io.fabric8.kubernetes.client.informers.ResourceEventHandler;
 import io.fabric8.kubernetes.client.informers.SharedIndexInformer;
@@ -41,9 +41,6 @@ import io.fabric8.kubernetes.client.informers.SharedInformerFactory;
 import io.fabric8.kubernetes.api.model.autoscaling.v1.HorizontalPodAutoscaler;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -56,16 +53,12 @@ import java.util.stream.Collectors;
 @DOceanPlugin
 @Slf4j
 public class K8sPlugin implements IPlugin {
-
+    public static final String UA_KEY = "K8S_CLIENT_UA";
     private KubernetesClient client;
-    private static final KubernetesClient DEFAULT_CLIENT;
-
-    static {
-        DEFAULT_CLIENT = new DefaultKubernetesClient();
-    }
+    private List<String> allowedNamespaces;
 
     /**
-     * custom resources definitions
+     * 自定义资源
      */
     private List<Crd> crdList = new ArrayList<>();
 
@@ -98,11 +91,19 @@ public class K8sPlugin implements IPlugin {
     @Override
     public void init(Set<? extends Class<?>> classSet, Ioc ioc) {
         log.info("init k8s plugin");
-        client = new DefaultKubernetesClient();
+        String userAgent = null;
+        if (StringUtils.isNotEmpty(System.getenv(UA_KEY))) {
+            userAgent = System.getenv(UA_KEY);
+        }
+        client = new DefaultKubernetesClient(new ConfigBuilder().withUserAgent(userAgent).build());
         ioc.putBean(KubernetesClient.class.getName(), client);
         Config config = ioc.getBean(Config.class);
         String customResourceStr = config.get("crd", "");
-        // custom resources
+        String namespaces = config.get("k8s.namespaces.allowed", "");
+        if (StringUtils.isNotEmpty(namespaces)) {
+            allowedNamespaces = Arrays.asList(namespaces.split(","));
+        }
+        //自定义资源
         if (StringUtils.isNotEmpty(customResourceStr)) {
             crdList = Arrays.stream(customResourceStr.split(";")).map(it -> {
                 String[] array = it.split(":");
@@ -126,25 +127,66 @@ public class K8sPlugin implements IPlugin {
         });
     }
 
+    private boolean clusterRD(String rd) {
+        Set<String> set = new HashSet<>();
+        set.add("nodeResourceEventHandler");
+        return set.contains(rd);
+    }
+
+    private boolean clusterCRD(Ioc ioc, String crd) {
+        Config config = ioc.getBean(Config.class);
+        String customResourceStr = config.get("crd.cluster", "");
+        Set<String> set = new HashSet<>(Arrays.asList(customResourceStr.split(",")));
+        return set.contains(crd);
+    }
 
     @SneakyThrows
     @Override
     public boolean start(Ioc ioc) {
         SharedInformerFactory informerFactory = client.informers();
 
+        Config config = ioc.getBean(Config.class);
+        String resyncStr = config.get("k8s.informer.resync", "10");
+        long resync = 10;
+        try {
+            resync = Long.parseLong(resyncStr);
+        } catch (Exception e) {
+            log.error("error parsing k8s.informer.resync {}", resyncStr, e);
+        }
+
+        long finalResync = resync;
         rdMap.entrySet().forEach(entry -> {
             ResourceEventHandler nodeResourceEventHandler = ioc.getBean(entry.getKey(), null);
             Optional.ofNullable(nodeResourceEventHandler).ifPresent(it -> {
-                SharedIndexInformer sharedIndexInformer = informerFactory.sharedIndexInformerFor(entry.getValue(), TimeUnit.MINUTES.toMillis(10));
-                sharedIndexInformer.addEventHandler(it);
+                if (allowedNamespaces != null &&
+                        !allowedNamespaces.isEmpty() &&
+                        !clusterRD(entry.getKey())) {
+                    for (String namespace : allowedNamespaces) {
+                        SharedIndexInformer sharedIndexInformer = informerFactory.inNamespace(namespace).sharedIndexInformerFor(entry.getValue(), TimeUnit.MINUTES.toMillis(finalResync));
+                        sharedIndexInformer.addEventHandler(it);
+                    }
+                } else {
+                    SharedIndexInformer sharedIndexInformer = informerFactory.sharedIndexInformerFor(entry.getValue(), TimeUnit.MINUTES.toMillis(finalResync));
+                    sharedIndexInformer.addEventHandler(it);
+                }
             });
         });
 
         crdList.stream().forEach(crd -> {
             ResourceEventHandler handler = ioc.getBean(crd.getHandlerName(), null);
+
             Optional.ofNullable(handler).ifPresent(it -> {
-                SharedIndexInformer sharedIndexInformer = informerFactory.sharedIndexInformerFor(ReflectUtils.classForName(crd.getResourceType()), TimeUnit.MINUTES.toMillis(10));
-                sharedIndexInformer.addEventHandler(it);
+                if (allowedNamespaces != null &&
+                        !allowedNamespaces.isEmpty() &&
+                        !clusterCRD(ioc, crd.getCrdName())) {
+                    for (String namespace : allowedNamespaces) {
+                        SharedIndexInformer sharedIndexInformer = informerFactory.inNamespace(namespace).sharedIndexInformerFor(ReflectUtils.classForName(crd.getResourceType()), TimeUnit.MINUTES.toMillis(finalResync));
+                        sharedIndexInformer.addEventHandler(it);
+                    }
+                } else {
+                    SharedIndexInformer sharedIndexInformer = informerFactory.sharedIndexInformerFor(ReflectUtils.classForName(crd.getResourceType()), TimeUnit.MINUTES.toMillis(finalResync));
+                    sharedIndexInformer.addEventHandler(it);
+                }
             });
         });
 
@@ -155,36 +197,4 @@ public class K8sPlugin implements IPlugin {
         return true;
     }
 
-    @SneakyThrows
-    private static Pair<Integer, String> execContainer(KubernetesClient client, String ns, String name, String container, String[] command) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        ByteArrayOutputStream error = new ByteArrayOutputStream();
-        try (ExecWatch execWatch = client.pods().inNamespace(ns).withName(name)
-                .inContainer(container)
-                .writingOutput(out)
-                .writingError(error)
-                .exec(command)) {
-            // 等待命令执行完成
-            execWatch.close();
-        }
-        // 返回执行结果
-        String result = out.toString();
-        System.out.println("result:" + result);
-        // 这里没有直接的退出值，你可能需要根据输出结果来判断命令是否成功执行
-        return Pair.of(0, result);
-
-    }
-
-    @SneakyThrows
-    public static Pair<Integer, String> KillContainer(String ns, String name, String container) {
-        String[] shs = new String[]{"bash", "ash", "sh"};
-        Pair<Integer, String> end = null;
-        for (String sh : shs) {
-            end = execContainer(DEFAULT_CLIENT, ns, name, container, new String[]{sh, "-c", "trap \"exit\" SIGINT SIGTERM ; kill -s SIGINT 1"});
-            if (end.getKey().equals(0)) {
-                break;
-            }
-        }
-        return end;
-    }
 }
